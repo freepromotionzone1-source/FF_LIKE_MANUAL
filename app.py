@@ -1,449 +1,825 @@
-from flask import Flask, request, jsonify
-import asyncio
+import threading
+import json
+import time
+import logging
+import socket
+import sys
+import os
+import base64
+import binascii
+import requests
+import jwt
+import psutil
+import re
+
+from datetime import datetime
+from google.protobuf.timestamp_pb2 import Timestamp
+from google.protobuf.json_format import MessageToJson
+
+import jwt_generator_pb2
+import MajorLoginRes_pb2
+
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-import binascii
-import aiohttp
-import requests
-import json
-import like_pb2
-import like_count_pb2
-import uid_generator_pb2
-import threading
-import urllib3
-import random
-import logging
-from datetime import datetime
-import os
 
-# Configuration
-TOKEN_BATCH_SIZE = 100
+import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Setup logging
+from protobuf_decoder.protobuf_decoder import Parser
+from important_zitado import *
+from byte import *
+
+
+START_SPAM_DURATION = 6
+WAIT_AFTER_MATCH_SECONDS = 24
+START_SPAM_DELAY = 0.2
+
+PROMO_TEXT = "Instagram: @6_hf0 | YouTube/Telegram: @Unknown_Reason"
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler('like_api.log'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler("start_teamcode_bot.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
-# Global State for Batch Management
-current_batch_indices = {}
-batch_indices_lock = threading.Lock()
+threads = []
+socket_client = None
+clients = None
+g_token = None
 
-def get_next_batch_tokens(server_name, all_tokens):
-    """Get next sequential batch of tokens"""
-    if not all_tokens:
-        return []
-    
-    total_tokens = len(all_tokens)
-    
-    # If we have fewer tokens than batch size, use all available tokens
-    if total_tokens <= TOKEN_BATCH_SIZE:
-        return all_tokens
-    
-    with batch_indices_lock:
-        if server_name not in current_batch_indices:
-            current_batch_indices[server_name] = 0
-        
-        current_index = current_batch_indices[server_name]
-        
-        # Calculate the batch
-        start_index = current_index
-        end_index = start_index + TOKEN_BATCH_SIZE
-        
-        # If we reach or exceed the end, wrap around
-        if end_index > total_tokens:
-            remaining = end_index - total_tokens
-            batch_tokens = all_tokens[start_index:total_tokens] + all_tokens[0:remaining]
-        else:
-            batch_tokens = all_tokens[start_index:end_index]
-        
-        # Update the index for next time
-        next_index = (current_index + TOKEN_BATCH_SIZE) % total_tokens
-        current_batch_indices[server_name] = next_index
-        
-        logging.info(f"Server {server_name}: Using batch starting at index {start_index}")
-        return batch_tokens
 
-def get_random_batch_tokens(server_name, all_tokens):
-    """Alternative method: use random sampling for better distribution"""
-    if not all_tokens:
-        return []
-    
-    total_tokens = len(all_tokens)
-    
-    # If we have fewer tokens than batch size, use all available tokens
-    if total_tokens <= TOKEN_BATCH_SIZE:
-        return all_tokens.copy()
-    
-    # Randomly select tokens without replacement
-    selected_tokens = random.sample(all_tokens, TOKEN_BATCH_SIZE)
-    logging.info(f"Server {server_name}: Selected {TOKEN_BATCH_SIZE} random tokens")
-    return selected_tokens
-
-def load_tokens(server_name, for_visit=False):
-    """Load tokens from JSON file based on server and type"""
-    if for_visit:
-        if server_name == "IND":
-            path = "token_ind_visit.json"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_br_visit.json"
-        else:
-            path = "token_bd_visit.json"
-    else:
-        if server_name == "IND":
-            path = "token_ind.json"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_br.json"
-        else:
-            path = "token_bd.json"
-
-    # Check if file exists
-    if not os.path.exists(path):
-        logging.warning(f"Token file {path} not found. Creating empty file...")
-        with open(path, "w") as f:
-            json.dump([], f)
-        return []
-
+def restart_program():
+    logging.warning("Initiating bot restart...")
     try:
-        with open(path, "r") as f:
-            tokens = json.load(f)
-            if isinstance(tokens, list):
-                # Validate token format
-                valid_tokens = []
-                for t in tokens:
-                    if isinstance(t, dict) and "token" in t:
-                        valid_tokens.append(t)
-                    elif isinstance(t, str):
-                        # Convert string tokens to dict format
-                        valid_tokens.append({"token": t})
-                
-                logging.info(f"Loaded {len(valid_tokens)} tokens from {path} for server {server_name}")
-                return valid_tokens
-            else:
-                logging.error(f"Token file {path} is not in the expected list format.")
-                return []
-    except FileNotFoundError:
-        logging.error(f"Token file {path} not found.")
-        return []
-    except json.JSONDecodeError as e:
-        logging.error(f"Token file {path} contains invalid JSON: {e}")
-        return []
+        p = psutil.Process(os.getpid())
+        
+        for handler in p.open_files() + p.connections():
+            try:
+                os.close(handler.fd)
+            except Exception as e:
+                logging.error(f"Failed to close handler {handler.fd}: {e}")
+    except Exception as e:
+        logging.error(f"Error during pre-restart cleanup: {e}")
 
-def encrypt_message(plaintext):
-    """Encrypt message using AES CBC mode"""
-    key = b'Yg&tc%DEuh6%Zc^8'
-    iv = b'6oyZDr22E3ychjM%'
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+
+
+def encrypt_packet(plain_text, key, iv):
+    if isinstance(key, str):
+        key = bytes.fromhex(key)
+    if isinstance(iv, str):
+        iv = bytes.fromhex(iv)
+    plain_text = bytes.fromhex(plain_text)
     cipher = AES.new(key, AES.MODE_CBC, iv)
-    padded_message = pad(plaintext, AES.block_size)
-    encrypted_message = cipher.encrypt(padded_message)
-    return binascii.hexlify(encrypted_message).decode('utf-8')
+    cipher_text = cipher.encrypt(pad(plain_text, AES.block_size))
+    return cipher_text.hex()
 
-def create_protobuf_message(user_id, region):
-    """Create protobuf message for like"""
-    message = like_pb2.like()
-    message.uid = int(user_id)
-    message.region = region
-    return message.SerializeToString()
 
-def create_protobuf_for_profile_check(uid):
-    """Create protobuf message for profile check"""
-    message = uid_generator_pb2.uid_generator()
-    message.krishna_ = int(uid)
-    message.teamXdarks = 1
-    return message.SerializeToString()
+def encrypt_api(plain_text):
+    plain_text = bytes.fromhex(plain_text)
+    key = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
+    iv = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    cipher_text = cipher.encrypt(pad(plain_text, AES.block_size))
+    return cipher_text.hex()
 
-def enc_profile_check_payload(uid):
-    """Encrypt profile check payload"""
-    protobuf_data = create_protobuf_for_profile_check(uid)
-    encrypted_uid = encrypt_message(protobuf_data)
-    return encrypted_uid
 
-async def send_single_like_request(encrypted_like_payload, token_dict, url):
-    """Send a single like request asynchronously"""
-    token_value = token_dict.get("token", "")
-    if not token_value:
-        logging.warning("send_single_like_request received an empty or invalid token_dict.")
-        return 999
+def parse_results(parsed_results):
+    result_dict = {}
+    for result in parsed_results:
+        field_data = {"wire_type": result.wire_type}
+        if result.wire_type in ("varint", "string", "bytes"):
+            field_data["data"] = result.data
+        elif result.wire_type == "length_delimited":
+            field_data["data"] = parse_results(result.data.results)
+        result_dict[result.field] = field_data
+    return result_dict
 
-    headers = {
-        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        'Connection': "Keep-Alive",
-        'Accept-Encoding': "gzip",
-        'Authorization': f"Bearer {token_value}",
-        'Content-Type': "application/x-www-form-urlencoded",
-        'Expect': "100-continue",
-        'X-Unity-Version': "2018.4.11f1",
-        'X-GA': "v1 1",
-        'ReleaseVersion': "OB52"
-    }
-    
+
+def get_available_room(input_text):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=encrypted_like_payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status != 200:
-                    logging.warning(f"Like request failed for token {token_value[:10]}... with status: {response.status}")
-                return response.status
-    except asyncio.TimeoutError:
-        logging.warning(f"Like request timed out for token {token_value[:10]}...")
-        return 998
+        parsed_results = Parser().parse(input_text)
+        parsed_results_dict = parse_results(parsed_results)
+        json_data = json.dumps(parsed_results_dict)
+        return json_data
     except Exception as e:
-        logging.error(f"Exception in send_single_like_request for token {token_value[:10]}...: {e}")
-        return 997
-
-async def send_likes_with_token_batch(uid, server_region_for_like_proto, like_api_url, token_batch_to_use):
-    """Send likes using a batch of tokens"""
-    if not token_batch_to_use:
-        logging.warning("No tokens provided in the batch to send_likes_with_token_batch.")
-        return []
-
-    # Create the like payload once for all requests
-    like_protobuf_payload = create_protobuf_message(uid, server_region_for_like_proto)
-    encrypted_like_payload = encrypt_message(like_protobuf_payload)
-    
-    # Create tasks for all tokens
-    tasks = []
-    for token_dict_for_request in token_batch_to_use:
-        tasks.append(send_single_like_request(encrypted_like_payload, token_dict_for_request, like_api_url))
-    
-    # Execute all tasks concurrently
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Count successful and failed requests
-    successful_sends = sum(1 for r in results if isinstance(r, int) and r == 200)
-    failed_sends = len(token_batch_to_use) - successful_sends
-    
-    logging.info(f"Attempted {len(token_batch_to_use)} like sends from batch. Successful: {successful_sends}, Failed/Error: {failed_sends}")
-    return results
-
-def make_profile_check_request(encrypted_profile_payload, server_name, token_dict):
-    """Make a profile check request to get like count"""
-    token_value = token_dict.get("token", "")
-    if not token_value:
-        logging.warning("make_profile_check_request received an empty token_dict.")
+        logging.error(f"error in get_available_room: {e}")
         return None
 
-    # Select URL based on server
-    if server_name == "IND":
-        url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-    else:
-        url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
 
-    edata = bytes.fromhex(encrypted_profile_payload)
-    headers = {
-        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        'Connection': "Keep-Alive",
-        'Accept-Encoding': "gzip",
-        'Authorization': f"Bearer {token_value}",
-        'Content-Type': "application/x-www-form-urlencoded",
-        'Expect': "100-continue",
-        'X-Unity-Version': "2018.4.11f1",
-        'X-GA': "v1 1",
-        'ReleaseVersion': "OB52"
-    }
+def dec_to_hex(ask: int) -> str:
+    ask_result = hex(ask)
+    final_result = str(ask_result)[2:]
+    if len(final_result) == 1:
+        final_result = "0" + final_result
+    return final_result
+
+
+def extract_jwt_from_hex(hex_str):
+    byte_data = binascii.unhexlify(hex_str)
+    message = jwt_generator_pb2.Garena_420()
+    message.ParseFromString(byte_data)
+    json_output = MessageToJson(message)
+    token_data = json.loads(json_output)
+    return token_data
+
+
+class FF_CLIENT(threading.Thread):
+    def __init__(self, uid, password):
+        super().__init__()
+        self.id = uid
+        self.password = password
+        self.key = None
+        self.iv = None
+        self.auto_start_running = False
+        self.auto_start_teamcode = None
+        self.stop_auto = False
+        self.get_tok()
+
     
-    try:
-        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
-        response.raise_for_status()
-        binary_data = response.content
-        decoded_info = decode_protobuf_profile_info(binary_data)
-        return decoded_info
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"HTTP error in make_profile_check_request for token {token_value[:10]}...: {e.response.status_code}")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Request error in make_profile_check_request for token {token_value[:10]}...: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error in make_profile_check_request: {e}")
-    return None
+    def parse_my_message(self, serialized_data):
+        MajorLogRes = MajorLoginRes_pb2.MajorLoginRes()
+        MajorLogRes.ParseFromString(serialized_data)
 
-def decode_protobuf_profile_info(binary_data):
-    """Decode protobuf profile information"""
-    try:
-        items = like_count_pb2.Info()
-        items.ParseFromString(binary_data)
-        return items
-    except Exception as e:
-        logging.error(f"Error decoding Protobuf profile data: {e}")
-        return None
+        timestamp = MajorLogRes.kts
+        key = MajorLogRes.ak
+        iv = MajorLogRes.aiv
+        BASE64_TOKEN = MajorLogRes.token
+        timestamp_obj = Timestamp()
+        timestamp_obj.FromNanoseconds(timestamp)
+        timestamp_seconds = timestamp_obj.seconds
+        timestamp_nanos = timestamp_obj.nanos
+        combined_timestamp = timestamp_seconds * 1_000_000_000 + timestamp_nanos
+        return combined_timestamp, key, iv, BASE64_TOKEN
 
-app = Flask(__name__)
+    def GET_PAYLOAD_BY_DATA(self, JWT_TOKEN, NEW_ACCESS_TOKEN, date):
+        token_payload_base64 = JWT_TOKEN.split(".")[1]
+        token_payload_base64 += "=" * ((4 - len(token_payload_base64) % 4) % 4)
+        decoded_payload = base64.urlsafe_b64decode(token_payload_base64).decode(
+            "utf-8"
+        )
+        decoded_payload = json.loads(decoded_payload)
+        NEW_EXTERNAL_ID = decoded_payload["external_id"]
+        SIGNATURE_MD5 = decoded_payload["signature_md5"]
 
-@app.route('/', methods=['GET'])
-def home():
-    """Home endpoint with API info"""
-    return jsonify({
-        "name": "FreeFire Like API",
-        "version": "1.0",
-        "endpoints": {
-            "/like": "Send likes to a profile (GET)",
-            "/token_info": "Check token counts (GET)"
-        },
-        "usage": "/like?uid=123456789&server_name=IND&random=false"
-    })
+        now = datetime.now()
+        now = str(now)[: len(str(now)) - 7]
 
-@app.route('/like', methods=['GET'])
-def handle_requests():
-    """Main endpoint to handle like requests"""
-    uid_param = request.args.get("uid")
-    server_name_param = request.args.get("server_name", "").upper()
-    use_random = request.args.get("random", "false").lower() == "true"
-
-    # Validate parameters
-    if not uid_param:
-        return jsonify({"error": "UID parameter is required"}), 400
-    
-    if not server_name_param:
-        return jsonify({"error": "Server name parameter is required"}), 400
-    
-    if not uid_param.isdigit():
-        return jsonify({"error": "UID must be a number"}), 400
-
-    logging.info(f"Processing like request: UID={uid_param}, Server={server_name_param}, Random={use_random}")
-
-    # Load visit token for profile checking
-    visit_tokens = load_tokens(server_name_param, for_visit=True)
-    if not visit_tokens:
-        error_msg = f"No visit tokens loaded for server {server_name_param}."
-        logging.error(error_msg)
-        return jsonify({"error": error_msg}), 500
-    
-    # Use the first visit token for profile check
-    visit_token = visit_tokens[0] if visit_tokens else None
-    
-    # Load regular tokens for like sending
-    all_available_tokens = load_tokens(server_name_param, for_visit=False)
-    if not all_available_tokens:
-        error_msg = f"No tokens loaded or token file invalid for server {server_name_param}."
-        logging.error(error_msg)
-        return jsonify({"error": error_msg}), 500
-
-    logging.info(f"Total tokens available for {server_name_param}: {len(all_available_tokens)}")
-
-    # Get the batch of tokens for like sending
-    if use_random:
-        tokens_for_like_sending = get_random_batch_tokens(server_name_param, all_available_tokens)
-        batch_type = "RANDOM"
-    else:
-        tokens_for_like_sending = get_next_batch_tokens(server_name_param, all_available_tokens)
-        batch_type = "ROTATING"
-    
-    logging.info(f"Using {batch_type} batch selection for {server_name_param} with {len(tokens_for_like_sending)} tokens")
-    
-    # Create encrypted payload for profile check
-    encrypted_player_uid_for_profile = enc_profile_check_payload(uid_param)
-    
-    # Get likes BEFORE using visit token
-    before_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
-    before_like_count = 0
-    
-    if before_info and hasattr(before_info, 'AccountInfo'):
-        before_like_count = int(before_info.AccountInfo.Likes)
-        logging.info(f"UID {uid_param} ({server_name_param}): Likes before = {before_like_count}")
-    else:
-        logging.warning(f"Could not reliably fetch 'before' profile info for UID {uid_param} on {server_name_param}.")
-
-    # Determine the URL for sending likes
-    if server_name_param == "IND":
-        like_api_url = "https://client.ind.freefiremobile.com/LikeProfile"
-    elif server_name_param in {"BR", "US", "SAC", "NA"}:
-        like_api_url = "https://client.us.freefiremobile.com/LikeProfile"
-    else:
-        like_api_url = "https://clientbp.ggblueshark.com/LikeProfile"
-
-    # Send likes using the token batch
-    if tokens_for_like_sending:
-        logging.info(f"Sending likes using {len(tokens_for_like_sending)} tokens to {like_api_url}")
         
-        # Create and run async event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(send_likes_with_token_batch(
-                uid_param, server_name_param, like_api_url, tokens_for_like_sending
-            ))
-        except Exception as e:
-            logging.error(f"Error in async like sending: {e}")
-        finally:
-            loop.close()
-    else:
-        logging.warning(f"Skipping like sending for UID {uid_param} as no tokens available.")
-    
-    # Get likes AFTER using visit token
-    after_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
-    after_like_count = before_like_count
-    actual_player_uid_from_profile = int(uid_param)
-    player_nickname_from_profile = "N/A"
+        payload = bytes.fromhex(
+            "1a13323032352d30372d33302031313a30323a3531220966726565206669726528013a07312e3132302e31422c416e64726f6964204f5320372e312e32202f204150492d323320284e32473438482f373030323530323234294a0848616e6468656c645207416e64726f69645a045749464960c00c68840772033332307a1f41524d7637205646507633204e454f4e20564d48207c2032343635207c203480019a1b8a010f416472656e6f2028544d292036343092010d4f70656e474c20455320332e319a012b476f6f676c657c31663361643662372d636562342d343934622d383730622d623164616364373230393131a2010c3139372e312e31322e313335aa0102656eb201203939366136323964626364623339363462653662363937386635643831346462ba010134c2010848616e6468656c64ca011073616d73756e6720534d2d473935354eea014066663930633037656239383135616633306134336234613966363031393531366530653463373033623434303932353136643064656661346365663531663261f00101ca0207416e64726f6964d2020457494649ca03203734323862323533646566633136343031386336303461316562626665626466e003daa907e803899b07f003bf0ff803ae088004999b078804daa9079004999b079804daa907c80403d204262f646174612f6170702f636f6d2e6474732e667265656669726574682d312f6c69622f61726de00401ea044832303837663631633139663537663261663465376665666630623234643964397c2f646174612f6170702f636f6d2e6474732e667265656669726574682d312f626173652e61706bf00403f804018a050233329a050a32303139313138363933a80503b205094f70656e474c455332b805ff7fc00504e005dac901ea0507616e64726f6964f2055c4b71734854394748625876574c6668437950416c52526873626d43676542557562555551317375746d525536634e30524f3751453141486e496474385963784d614c575437636d4851322b7374745279377830663935542b6456593d8806019006019a060134a2060134b2061e40001147550d0c074f530b4d5c584d57416657545a065f2a091d6a0d5033"
+        )
+        payload = payload.replace(b"2025-07-30 11:02:51", str(now).encode())
+        payload = payload.replace(
+            b"ff90c07eb9815af30a43b4a9f6019516e0e4c703b44092516d0defa4cef51f2a",
+            NEW_ACCESS_TOKEN.encode("UTF-8"),
+        )
+        payload = payload.replace(
+            b"996a629dbcdb3964be6b6978f5d814db",
+            NEW_EXTERNAL_ID.encode("UTF-8"),
+        )
+        payload = payload.replace(
+            b"7428b253defc164018c604a1ebbfebdf",
+            SIGNATURE_MD5.encode("UTF-8"),
+        )
+        PAYLOAD = payload.hex()
+        PAYLOAD = encrypt_api(PAYLOAD)
+        PAYLOAD = bytes.fromhex(PAYLOAD)
+        whisper_ip, whisper_port, online_ip, online_port = self.GET_LOGIN_DATA(
+            JWT_TOKEN, PAYLOAD
+        )
+        return whisper_ip, whisper_port, online_ip, online_port
 
-    if after_info and hasattr(after_info, 'AccountInfo'):
-        after_like_count = int(after_info.AccountInfo.Likes)
-        actual_player_uid_from_profile = int(after_info.AccountInfo.UID)
-        if after_info.AccountInfo.PlayerNickname:
-            player_nickname_from_profile = str(after_info.AccountInfo.PlayerNickname)
-        else:
-            player_nickname_from_profile = "N/A"
-        logging.info(f"UID {uid_param} ({server_name_param}): Likes after = {after_like_count}")
-    else:
-        logging.warning(f"Could not reliably fetch 'after' profile info for UID {uid_param} on {server_name_param}.")
-
-    likes_increment = after_like_count - before_like_count
-    
-    # Determine status code
-    if likes_increment > 0:
-        request_status = 1  # Success
-    elif likes_increment == 0:
-        request_status = 2  # No change
-    else:
-        request_status = 3  # Decreased (unusual)
-
-    response_data = {
-        "LikesGivenByAPI": likes_increment,
-        "LikesafterCommand": after_like_count,
-        "LikesbeforeCommand": before_like_count,
-        "PlayerNickname": player_nickname_from_profile,
-        "UID": actual_player_uid_from_profile,
-        "status": request_status,
-        "batch_size": len(tokens_for_like_sending),
-        "batch_type": batch_type,
-        "timestamp": datetime.now().isoformat(),
-        "Note": f"Used visit token for profile check and {batch_type.lower()} batch of {len(tokens_for_like_sending)} tokens for like sending."
-    }
-    
-    logging.info(f"Like request completed for UID {uid_param}: +{likes_increment} likes")
-    return jsonify(response_data)
-
-@app.route('/token_info', methods=['GET'])
-def token_info():
-    """Endpoint to check token counts for each server"""
-    servers = ["IND", "BD", "BR", "US", "SAC", "NA"]
-    info = {}
-    
-    for server in servers:
-        regular_tokens = load_tokens(server, for_visit=False)
-        visit_tokens = load_tokens(server, for_visit=True)
-        info[server] = {
-            "regular_tokens": len(regular_tokens),
-            "visit_tokens": len(visit_tokens)
+    def GET_LOGIN_DATA(self, JWT_TOKEN, PAYLOAD):
+        url = "https://client.ind.freefiremobile.com/GetLoginData"
+        headers = {
+            "Expect": "100-continue",
+            "Authorization": f"Bearer {JWT_TOKEN}",
+            "X-Unity-Version": "2018.4.11f1",
+            "X-GA": "v1 1",
+            "ReleaseVersion": "OB52",  
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; G011A Build/PI)",
+            "Host": "clientbp.common.ggbluefox.com",
+            "Connection": "close",
+            "Accept-Encoding": "gzip, deflate, br",
         }
+
+        max_retries = 3
+        attempt = 0
+
+        while attempt < max_retries:
+            try:
+                response = requests.post(
+                    url, headers=headers, data=PAYLOAD, verify=False
+                )
+                response.raise_for_status()
+                x = response.content.hex()
+                json_result = get_available_room(x)
+                if not json_result:
+                    raise ValueError("Empty json_result from get_available_room()")
+                parsed_data = json.loads(json_result)
+
+                whisper_address = parsed_data["32"]["data"]
+                online_address = parsed_data["14"]["data"]
+
+                
+                online_ip = online_address[: len(online_address) - 6]
+                whisper_ip = whisper_address[: len(whisper_address) - 6]
+
+                online_port = int(online_address[len(online_address) - 5 :])
+                whisper_port = int(whisper_address[len(whisper_address) - 5 :])
+
+                return whisper_ip, whisper_port, online_ip, online_port
+
+
+            except Exception as e:
+                logging.error(
+                    f"Request failed in GET_LOGIN_DATA: {e}. Attempt {attempt + 1} of {max_retries}. Retrying..."
+                )
+                attempt += 1
+                time.sleep(2)
+
+        logging.critical("Failed to get login data after multiple attempts. Restarting.")
+        restart_program()
+        return None, None, None, None
+
+    def guest_token(self, uid, password):
+        url = "https://100067.connect.garena.com/oauth/guest/token/grant"
+        headers = {
+            "Host": "100067.connect.garena.com",
+            "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 10;en;EN;)",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "close",
+        }
+        data = {
+            "uid": f"{uid}",
+            "password": f"{password}",
+            "response_type": "token",
+            "client_type": "2",
+            "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
+            "client_id": "100067",
+        }
+        response = requests.post(url, headers=headers, data=data)
+        data = response.json()
+        NEW_ACCESS_TOKEN = data["access_token"]
+        NEW_OPEN_ID = data["open_id"]
+        OLD_ACCESS_TOKEN = (
+            "ff90c07eb9815af30a43b4a9f6019516e0e4c703b44092516d0defa4cef51f2a"
+        )
+        OLD_OPEN_ID = "996a629dbcdb3964be6b6978f5d814db"
+        time.sleep(0.2)
+        data = self.TOKEN_MAKER(
+            OLD_ACCESS_TOKEN, NEW_ACCESS_TOKEN, OLD_OPEN_ID, NEW_OPEN_ID, uid
+        )
+        return data
+
+    def TOKEN_MAKER(
+        self, OLD_ACCESS_TOKEN, NEW_ACCESS_TOKEN, OLD_OPEN_ID, NEW_OPEN_ID, id
+    ):
+        headers = {
+            "X-Unity-Version": "2018.4.11f1",
+            "ReleaseVersion": "OB52",  
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-GA": "v1 1",
+            "Content-Length": "928",
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 7.1.2; ASUS_Z01QD Build/QKQ1.190825.002)",
+            "Host": "loginbp.ggblueshark.com",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+        }
+        
+        data = bytes.fromhex(
+            "1a13323032352d30372d33302031313a30323a3531220966726565206669726528013a07312e3132302e31422c416e64726f6964204f5320372e312e32202f204150492d323320284e32473438482f373030323530323234294a0848616e6468656c645207416e64726f69645a045749464960c00c68840772033332307a1f41524d7637205646507633204e454f4e20564d48207c2032343635207c203480019a1b8a010f416472656e6f2028544d292036343092010d4f70656e474c20455320332e319a012b476f6f676c657c31663361643662372d636562342d343934622d383730622d623164616364373230393131a2010c3139372e312e31322e313335aa0102656eb201203939366136323964626364623339363462653662363937386635643831346462ba010134c2010848616e6468656c64ca011073616d73756e6720534d2d473935354eea014066663930633037656239383135616633306134336234613966363031393531366530653463373033623434303932353136643064656661346365663531663261f00101ca0207416e64726f6964d2020457494649ca03203734323862323533646566633136343031386336303461316562626665626466e003daa907e803899b07f003bf0ff803ae088004999b078804daa9079004999b079804daa907c80403d204262f646174612f6170702f636f6d2e6474732e667265656669726574682d312f6c69622f61726de00401ea044832303837663631633139663537663261663465376665666630623234643964397c2f646174612f6170702f636f6d2e6474732e667265656669726574682d312f626173652e61706bf00403f804018a050233329a050a32303139313138363933a80503b205094f70656e474c455332b805ff7fc00504e005dac901ea0507616e64726f6964f2055c4b71734854394748625876574c6668437950416c52526873626d43676542557562555551317375746d525536634e30524f3751453141486e496474385963784d614c575437636d4851322b7374745279377830663935542b6456593d8806019006019a060134a2060134b2061e40001147550d0c074f530b4d5c584d57416657545a065f2a091d6a0d5033"
+        )
+        data = data.replace(OLD_OPEN_ID.encode(), NEW_OPEN_ID.encode())
+        data = data.replace(OLD_ACCESS_TOKEN.encode(), NEW_ACCESS_TOKEN.encode())
+        hex_data = data.hex()
+        d = encrypt_api(hex_data)
+        Final_Payload = bytes.fromhex(d)
+        URL = "https://loginbp.ggblueshark.com/MajorLogin"
+
+        RESPONSE = requests.post(URL, headers=headers, data=Final_Payload, verify=False)
+
+        combined_timestamp, key, iv, BASE64_TOKEN = self.parse_my_message(
+            RESPONSE.content
+        )
+        if RESPONSE.status_code == 200:
+            if len(RESPONSE.text) < 10:
+                return False
+            whisper_ip, whisper_port, online_ip, online_port = self.GET_PAYLOAD_BY_DATA(
+                BASE64_TOKEN, NEW_ACCESS_TOKEN, 1
+            )
+            self.key = key
+            self.iv = iv
+            return (
+                BASE64_TOKEN,
+                key,
+                iv,
+                combined_timestamp,
+                whisper_ip,
+                whisper_port,
+                online_ip,
+                online_port,
+            )
+        else:
+            return False
+
+    def nmnmmmmn(self, data_hex):
+        key, iv = self.key, self.iv
+        try:
+            key = key if isinstance(key, bytes) else bytes.fromhex(key)
+            iv = iv if isinstance(iv, bytes) else bytes.fromhex(iv)
+            data = bytes.fromhex(data_hex)
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            cipher_text = cipher.encrypt(pad(data, AES.block_size))
+            return cipher_text.hex()
+        except Exception as e:
+            logging.error(f"Error in nmnmmmmn: {e}")
+
     
-    return jsonify({
-        "token_counts": info,
-        "timestamp": datetime.now().isoformat()
-    })
+    def start_autooo(self):
+        fields = {
+            1: 9,
+            2: {
+                1: 12480598706,
+            },
+        }
+        packet = create_protobuf_packet(fields).hex()
+        header_length = len(encrypt_packet(packet, self.key, self.iv)) // 2
+        header_length_final = dec_to_hex(header_length)
+        if len(header_length_final) == 2:
+            final_packet = "0515000000" + header_length_final + self.nmnmmmmn(packet)
+        elif len(header_length_final) == 3:
+            final_packet = "051500000" + header_length_final + self.nmnmmmmn(packet)
+        elif len(header_length_final) == 4:
+            final_packet = "05150000" + header_length_final + self.nmnmmmmn(packet)
+        elif len(header_length_final) == 5:
+            final_packet = "0515000" + header_length_final + self.nmnmmmmn(packet)
+        return bytes.fromhex(final_packet)
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    })
+    def leave_s(self):
+        fields = {
+            1: 7,
+            2: {
+                1: 12480598706,
+            },
+        }
+        packet = create_protobuf_packet(fields).hex()
+        header_length = len(encrypt_packet(packet, self.key, self.iv)) // 2
+        header_length_final = dec_to_hex(header_length)
+        if len(header_length_final) == 2:
+            final_packet = "0515000000" + header_length_final + self.nmnmmmmn(packet)
+        elif len(header_length_final) == 3:
+            final_packet = "051500000" + header_length_final + self.nmnmmmmn(packet)
+        elif len(header_length_final) == 4:
+            final_packet = "05150000" + header_length_final + self.nmnmmmmn(packet)
+        elif len(header_length_final) == 5:
+            final_packet = "0515000" + header_length_final + self.nmnmmmmn(packet)
+        return bytes.fromhex(final_packet)
 
-if __name__ == '__main__':
-    logging.info("Starting FreeFire Like API server on port 5001...")
-    app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
+    def GenResponsMsg(self, Msg, Enc_Id):
+        fields = {
+            1: 1,
+            2: {
+                1: 12947146032,
+                2: Enc_Id,
+                3: 2,
+                4: str(Msg),
+                5: int(datetime.now().timestamp()),
+                7: 2,
+                9: {
+                    1: "SHADOW",
+                    2: 902050001,
+                    3: 901049014,
+                    4: 330,
+                    5: 801040108,
+                    8: "Friend",
+                    10: 1,
+                    11: 1,
+                },
+                10: "IND",
+            },
+        }
+        packet = create_protobuf_packet(fields).hex()
+        header_length = len(encrypt_packet(packet, self.key, self.iv)) // 2
+        header_length_final = dec_to_hex(header_length)
+        if len(header_length_final) == 2:
+            final_packet = "1215000000" + header_length_final + self.nmnmmmmn(packet)
+        elif len(header_length_final) == 3:
+            final_packet = "121500000" + header_length_final + self.nmnmmmmn(packet)
+        elif len(header_length_final) == 4:
+            final_packet = "12150000" + header_length_final + self.nmnmmmmn(packet)
+        elif len(header_length_final) == 5:
+            final_packet = "1215000" + header_length_final + self.nmnmmmmn(packet)
+        return bytes.fromhex(final_packet)
+
+    
+    def auto_start_loop(self, team_code, uid):
+        global socket_client, clients
+        logging.info(f"[AUTO] Auto start loop started for team {team_code}")
+
+        while not self.stop_auto:
+            try:
+                
+                join_teamcode(socket_client, team_code, self.key, self.iv)
+                time.sleep(2)
+
+                if clients:
+                    msg = f"[C][B][FFA500]Team {team_code} joined. Starting match..."
+                    msg += f"\n{PROMO_TEXT}"
+                    clients.send(self.GenResponsMsg(msg, uid))
+
+                
+                start_packet = self.start_autooo()
+                end_time = time.time() + START_SPAM_DURATION
+                while time.time() < end_time and not self.stop_auto:
+                    socket_client.send(start_packet)
+                    time.sleep(START_SPAM_DELAY)
+
+                if self.stop_auto:
+                    break
+
+                
+                if clients:
+                    msg = (
+                        f"[C][B][00FF00]Match started. Bot lobby me wait karega "
+                        f"{WAIT_AFTER_MATCH_SECONDS} sec..."
+                    )
+                    msg += f"\n{PROMO_TEXT}"
+                    clients.send(self.GenResponsMsg(msg, uid))
+
+                waited = 0
+                while waited < WAIT_AFTER_MATCH_SECONDS and not self.stop_auto:
+                    time.sleep(1)
+                    waited += 1
+
+                if self.stop_auto:
+                    break
+
+                
+                leave_packet = self.leave_s()
+                socket_client.send(leave_packet)
+                logging.info(f"[AUTO] Left team {team_code} to rejoin again.")
+                time.sleep(2)
+
+                if clients:
+                    msg = (
+                        f"[C][B][FF0000]Leaving team {team_code} and rejoining to force start again..."
+                    )
+                    msg += f"\n{PROMO_TEXT}"
+                    clients.send(self.GenResponsMsg(msg, uid))
+
+
+            except Exception as e:
+                logging.error(f"[AUTO] Error in auto_start_loop: {e}", exc_info=True)
+                
+                self.stop_auto = True
+                self.auto_start_running = False
+                restart_program()
+                break
+
+
+        logging.info(f"[AUTO] Auto start loop stopped for team {team_code}")
+
+    
+
+    def sockf1(self, tok, online_ip, online_port):
+        global socket_client
+        socket_client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        online_port = int(online_port)
+
+        try:
+            socket_client.settimeout(10)
+            socket_client.connect((online_ip, online_port))
+        except Exception as e:
+            logging.error(
+                f"[ONLINE] Failed to connect to {online_ip}:{online_port}: {e}. Restarting."
+            )
+            restart_program()
+            return
+
+        socket_client.settimeout(None)
+        socket_client.send(bytes.fromhex(tok))
+        logging.info(f"[ONLINE] Connected to {online_ip}:{online_port}")
+
+        while True:
+            try:
+                data2 = socket_client.recv(4096)
+                if data2 == b"":
+                    logging.error("Online socket closed by remote host. Restarting.")
+                    restart_program()
+                    break
+            except Exception as e:
+                logging.critical(f"Unhandled error in sockf1 loop: {e}. Restarting.")
+                restart_program()
+                break
+
+
+    def connect(self, tok, whisper_ip, whisper_port, online_ip, online_port):
+        global clients
+        global socket_client
+
+        clients = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        whisper_port = int(whisper_port)
+        clients.connect((whisper_ip, whisper_port))
+        clients.send(bytes.fromhex(tok))
+        logging.info(f"[WHISPER] Connected to {whisper_ip}:{whisper_port}")
+
+        thread = threading.Thread(
+            target=self.sockf1, args=(tok, online_ip, online_port)
+        )
+        threads.append(thread)
+        thread.start()
+
+        while True:
+            try:
+                data = clients.recv(9999)
+                if data == b"":
+                    logging.error("Whisper socket closed by remote host. Restarting.")
+                    restart_program()
+                    break
+
+                
+                if b"/urxff" in data:
+                    try:
+                        json_result = get_available_room(data.hex()[10:])
+                        if not json_result:
+                            logging.warning("get_available_room returned None for /urxff")
+                            continue
+
+                        parsed_data = json.loads(json_result)
+                        uid = (
+                            parsed_data.get("5", {})
+                            .get("data", {})
+                            .get("1", {})
+                            .get("data", None)
+                        )
+                        if uid is None:
+                            logging.warning("UID not found in parsed_data for /urxff")
+                            continue
+
+                        split_data = re.split(rb"/urxff", data, maxsplit=1)
+                        if len(split_data) < 2:
+                            msg = "[C][B][FF0000]Please provide a team code after /urxff."
+                            msg += f"\n{PROMO_TEXT}"
+                            clients.send(self.GenResponsMsg(msg, uid))
+                            continue
+
+                        
+                        cmd_text = (
+                            split_data[1]
+                            .split(b"(")[0]
+                            .decode(errors="ignore")
+                            .strip()
+                        )
+
+                        
+                        command_parts = cmd_text.split()
+                        if not command_parts:
+                            msg = "[C][B][FF0000]Please provide a team code."
+                            msg += f"\n{PROMO_TEXT}"
+                            clients.send(self.GenResponsMsg(msg, uid))
+                            continue
+
+                        team_code = command_parts[0]
+
+                        
+                        if not team_code.isdigit():
+                            msg = (
+                                "[C][B][FF0000]Invalid team code! "
+                                "Please use like /urxff123456 (only numbers)."
+                            )
+                            msg += f"\n{PROMO_TEXT}"
+                            clients.send(self.GenResponsMsg(msg, uid))
+                            continue
+
+                        if self.auto_start_running:
+                            msg = (
+                                f"[C][B][00FFFF]Auto start already running for team "
+                                f"{self.auto_start_teamcode}. Use /stop to disable."
+                            )
+                            msg += f"\n{PROMO_TEXT}"
+                            clients.send(self.GenResponsMsg(msg, uid))
+                            continue
+
+                        self.auto_start_running = True
+                        self.auto_start_teamcode = team_code
+                        self.stop_auto = False
+
+                        msg = (
+                            f"[C][B][FFA500]Auto start enabled for team {team_code}. "
+                            f"Bot join → start → wait → leave → rejoin 24x7."
+                        )
+                        msg += f"\n{PROMO_TEXT}"
+                        clients.send(self.GenResponsMsg(msg, uid))
+
+                        t = threading.Thread(
+                            target=self.auto_start_loop,
+                            args=(team_code, uid),
+                            daemon=True,
+                        )
+                        t.start()
+
+                    except Exception as e:
+                        logging.error(f"An error occurred in /urxff command: {e}", exc_info=True)
+                        
+                        try:
+                            json_result = get_available_room(data.hex()[10:])
+                            if json_result:
+                                parsed_data = json.loads(json_result)
+                                uid = (
+                                    parsed_data.get("5", {})
+                                    .get("data", {})
+                                    .get("1", {})
+                                    .get("data", None)
+                                )
+                                if uid:
+                                    msg = (
+                                        "[C][B][FF0000]Something went wrong in /urxff. "
+                                        "Please use format: /urxff123456 (numbers only)."
+                                    )
+                                    msg += f"\n{PROMO_TEXT}"
+                                    clients.send(self.GenResponsMsg(msg, uid))
+                        except Exception:
+                            pass
+                        continue
+
+                
+                if b"/stop" in data:
+                    try:
+                        json_result = get_available_room(data.hex()[10:])
+                        if not json_result:
+                            logging.warning("get_available_room returned None for /stop")
+                            continue
+
+                        parsed_data = json.loads(json_result)
+                        uid = (
+                            parsed_data.get("5", {})
+                            .get("data", {})
+                            .get("1", {})
+                            .get("data", None)
+                        )
+                        if uid is None:
+                            logging.warning("UID not found in parsed_data for /stop")
+                            continue
+
+                        if not self.auto_start_running:
+                            msg = "[C][B][FF0000]Auto start already stopped."
+                            msg += f"\n{PROMO_TEXT}"
+                            clients.send(self.GenResponsMsg(msg, uid))
+                            continue
+
+                        self.stop_auto = True
+                        self.auto_start_running = False
+
+                        msg = (
+                            f"[C][B][00FF00]Auto start stopped for team {self.auto_start_teamcode}."
+                        )
+                        msg += f"\n{PROMO_TEXT}"
+                        clients.send(self.GenResponsMsg(msg, uid))
+                        self.auto_start_teamcode = None
+
+                    except Exception as e:
+                        logging.error(f"An error occurred in /stop command: {e}", exc_info=True)
+                        
+                        continue
+
+               
+                if b"/help" in data:
+                    try:
+                        json_result = get_available_room(data.hex()[10:])
+                        if not json_result:
+                            logging.warning("get_available_room returned None for /help")
+                            continue
+
+                        parsed_data = json.loads(json_result)
+                        uid = (
+                            parsed_data.get("5", {})
+                            .get("data", {})
+                            .get("1", {})
+                            .get("data", None)
+                        )
+                        if uid is None:
+                            logging.warning("UID not found in parsed_data for /help")
+                            continue
+
+                        msg = (
+                            "[C][B][00FFFF]Choose Lone Wolf map and select 1v1 mode "
+                            "then use command /urxff{teamcode}\n"
+                            "Example: /urxff123456"
+                        )
+                        msg += f"\n{PROMO_TEXT}"
+
+                        clients.send(self.GenResponsMsg(msg, uid))
+
+                    except Exception as e:
+                        logging.error(f"An error occurred in /help command: {e}", exc_info=True)
+
+                        continue
+
+            except Exception as e:
+                logging.critical(
+                    f"A critical unhandled error occurred in connect loop: {e}. Restarting."
+                )
+                restart_program()
+
+    def get_tok(self):
+        global g_token
+        token_data = self.guest_token(self.id, self.password)
+        if not token_data:
+            logging.critical("Failed to get token data from guest_token. Restarting.")
+            restart_program()
+
+        (
+            token,
+            key,
+            iv,
+            Timestamp,
+            whisper_ip,
+            whisper_port,
+            online_ip,
+            online_port,
+        ) = token_data
+        g_token = token
+
+        try:
+            decoded = jwt.decode(token, options={"verify_signature": False})
+            account_id = decoded.get("account_id")
+            encoded_acc = hex(account_id)[2:]
+            hex_value = dec_to_hex(Timestamp)
+            time_hex = hex_value
+            BASE64_TOKEN_ = token.encode().hex()
+            logging.info(f"Token decoded. Account ID: {account_id}")
+        except Exception as e:
+            logging.error(f"Error processing token: {e}. Restarting.")
+            restart_program()
+
+        try:
+            head_len = len(encrypt_packet(BASE64_TOKEN_, key, iv)) // 2
+            head_len_hex = hex(head_len)[2:]
+
+            length = len(encoded_acc)
+            zeros = "00000000"
+            if length == 9:
+                zeros = "0000000"
+            elif length == 8:
+                zeros = "00000000"
+            elif length == 10:
+                zeros = "000000"
+            elif length == 7:
+                zeros = "000000000"
+            else:
+                logging.warning("Unexpected length encountered")
+
+            head = f"0115{zeros}{encoded_acc}{time_hex}00000{head_len_hex}"
+            final_token = head + encrypt_packet(BASE64_TOKEN_, key, iv)
+            logging.info("Final token constructed successfully.")
+        except Exception as e:
+            logging.error(f"Error constructing final token: {e}. Restarting.")
+            restart_program()
+
+        self.key = key
+        self.iv = iv
+        self.connect(final_token, whisper_ip, whisper_port, online_ip, online_port)
+
+
+
+if __name__ == "__main__":
+    with open("bot.txt", "r") as file:
+        data = json.load(file)
+
+    ids_passwords = list(data.items())
+    num_clients = len(ids_passwords)
+    num_threads = 1
+
+    while True:
+        try:
+            logging.info("Main execution block started (/urxff, /stop, /help bot).")
+
+            for i in range(num_threads):
+                uid, pwd = ids_passwords[i % num_clients]
+                logging.info(f"Starting client for ID: {uid}")
+                FF_CLIENT(uid, pwd)
+                time.sleep(3)
+
+            logging.info(
+                f"All {len(threads)} online threads initiated. Main thread will now wait."
+            )
+            for thread in threads:
+                thread.join()
+
+        except KeyboardInterrupt:
+            logging.info("Shutdown signal received. Exiting.")
+            break
+        except Exception as e:
+            logging.critical(f"A critical error occurred in the main block: {e}")
+            logging.info("Restarting the entire application in 5 seconds...")
+            time.sleep(5)
+            restart_program()
